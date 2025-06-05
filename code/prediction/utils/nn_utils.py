@@ -9,17 +9,20 @@ from typing import Any
 
 
 class SiameseNN(nn.Module):
-    def __init__(self, params):
+    def __init__(self, params, device):
         super(SiameseNN, self).__init__()
-        self.base_network = create_base_network(params)
+        self.device = device
+        self.base_network = create_base_network(params, device=self.device)
 
     def forward(self, x1, x2):
         h1 = self.base_network(x1)
         h2 = self.base_network(x2)
         delta_h = torch.abs(h1 - h2)
         dh_size = delta_h.size(1)
-        d_logit = nn.Linear(dh_size, 1)(delta_h)
+        # d_logit = nn.Linear(dh_size, 1, device=self.device)(delta_h)
+        d_logit = torch.mean(delta_h, dim=1).reshape(-1, 1)
         d_sigmoid = nn.Sigmoid()(d_logit)
+
         return d_sigmoid
 
 
@@ -32,11 +35,13 @@ def get_activation(params):
     }
     return activation_map[params['activation']]
 
+
 def get_scheduler(optimizer, params):
     scheduler_map = {
-        'linear':  torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1, end_factor=0, total_iters=params['num_epochs']),
+        'linear': torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1, end_factor=0,
+                                                    total_iters=params['num_epochs']),
         'cosine': torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=params['num_epochs']),
-        'plateau': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=params['patience'])
+        'plateau': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
     }
     """
     'exp': torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=params['gamma']),
@@ -47,8 +52,7 @@ def get_scheduler(optimizer, params):
     return scheduler_map[params['scheduler']]
 
 
-
-def should_stop(loss: list, patience: int=3) -> bool:
+def should_stop(loss: list, patience: int = 3) -> bool:
     """
     implementation of early stopping
     :param loss: loss function list
@@ -61,12 +65,10 @@ def should_stop(loss: list, patience: int=3) -> bool:
     increasing = all(x < y for x, y in zip(recent_loss, recent_loss[1:]))
     return increasing
 
+
 def train_model_nn(X_train_1: torch.Tensor, X_train_2: torch.Tensor, y_train: torch.Tensor,
                    X_val_1: torch.Tensor, X_val_2: torch.Tensor, y_val: torch.Tensor,
-                   params: dict, check_val: bool=False) -> tuple[float, Any, Any]:
-
-
-
+                   params: dict, device: torch.device, check_val: bool = True) -> tuple[float, Any, Any]:
     # Standardizing data
 
     # scaler = StandardScaler()
@@ -81,7 +83,7 @@ def train_model_nn(X_train_1: torch.Tensor, X_train_2: torch.Tensor, y_train: to
     train_dataset = TensorDataset(X_train_1, X_train_2, y_train)
 
     # Defining model
-    model = SiameseNN(params)
+    model = SiameseNN(params, device=device)
 
     # Defining training parameters
     criterion = nn.BCELoss()
@@ -99,14 +101,17 @@ def train_model_nn(X_train_1: torch.Tensor, X_train_2: torch.Tensor, y_train: to
         curr_batch = 0
         # for each batch in the epoch
         for X_1_batch, X_2_batch, y_batch in train_loader:
+            X_1_batch = X_1_batch.to(device)
+            X_2_batch = X_2_batch.to(device)
+            y_batch = y_batch.to(device)
             optimizer.zero_grad()
             y_pred = model(X_1_batch, X_2_batch)
             loss = criterion(y_pred, y_batch)
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item() * X_1_batch.size(0)/len(train_loader.dataset)
+            epoch_loss += loss.item() * X_1_batch.size(0) / len(train_loader.dataset)
             curr_batch += 1
-            print(f'batch: {curr_batch} out of {len(train_loader)}. loss: {loss.item()}')
+            # print(f'batch: {curr_batch} out of {len(train_loader)}. loss: {loss.item()}')
         epoch_losses.append(epoch_loss)
 
         # Checking validation loss for this epoch
@@ -114,19 +119,22 @@ def train_model_nn(X_train_1: torch.Tensor, X_train_2: torch.Tensor, y_train: to
             model.eval()
             with torch.no_grad():
                 y_val_pred = model(X_val_1, X_val_2)
-                val_loss = criterion(y_val_pred, y_val)
-                val_losses.append(val_loss)
+                val_loss = criterion(y_val_pred, y_val).cpu()
+            val_losses.append(val_loss)
 
             # Early stopping
             if should_stop(val_losses):
-                break
+                # break
+                print("huh")
 
-        print(f'epoch: {epoch}, loss: {np.mean(epoch_losses)}, val_loss: {np.mean(val_losses)}')
+        # print(len(val_losses))
+
+        # print(f'epoch: {epoch}, loss: {epoch_loss}, val_loss: {val_loss}')
     scaler = 'no scaler for now...'
-    return np.mean(val_losses), model, scaler
+    return val_losses, model.cpu(), scaler
 
 
-def create_base_network(params: dict) -> nn.Module:
+def create_base_network(params: dict, device: torch.device) -> nn.Module:
     """
     Creates the base network. Two copies of this network are used to create the siamese twins.
     :param params: parameter dictionary
@@ -139,10 +147,10 @@ def create_base_network(params: dict) -> nn.Module:
     layers = []
     for i in range(n_convs):
         layers.append(nn.BatchNorm2d(channels[i]))
-        layers.append(nn.Conv2d(in_channels=channels[i], out_channels=channels[i+1],
+        layers.append(nn.Conv2d(in_channels=channels[i], out_channels=channels[i + 1],
                                 kernel_size=params['kernel_size'][i], padding=1))
         layers.append(activation_func)
         layers.append(nn.MaxPool2d(kernel_size=2))
     layers.append(nn.Flatten(start_dim=1))
-    model = nn.Sequential(*layers)
+    model = nn.Sequential(*layers).to(device)
     return model
